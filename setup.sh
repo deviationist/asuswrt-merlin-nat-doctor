@@ -25,8 +25,13 @@ say "  - 'Enable JFFS custom scripts and configs' = Yes"
 say "  - 'Enable SSH' = LAN only"
 say ""
 
-ask "Router address [192.168.1.1]: "
-HOST=${REPLY:-192.168.1.1}
+# ASUS ships both 192.168.50.1 (most modern models, incl. the Wi-Fi 7 line
+# this bug is reported on) and 192.168.1.1 (older models) as factory defaults.
+# Anything else means the owner changed it — hence the prompt.
+say "Your router's LAN address — ASUS factory defaults are 192.168.50.1"
+say "(most current models) or 192.168.1.1 (older). Yours may differ."
+ask "Router address [192.168.50.1]: "
+HOST=${REPLY:-192.168.50.1}
 ask "SSH username [admin]: "
 USER=${REPLY:-admin}
 TARGET="$USER@$HOST"
