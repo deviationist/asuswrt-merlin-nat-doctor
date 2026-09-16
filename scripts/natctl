@@ -1,0 +1,300 @@
+#!/bin/sh
+# natctl — nat-doctor control + watchdog for Asuswrt-Merlin.
+#
+# THE FAULT (stock AsusWRT — Merlin and stock are equally affected):
+# a WAN link flap SHORTER than the dual-WAN failover threshold
+# (wandog_interval x wandog_maxfail) never reaches `wanduck`. It is handled
+# instead by udhcpc's lightweight re-init path, which serialises through a
+# single-slot rc_service queue. With only a few seconds between the down and
+# up events the two sequences collide, a service wedges on stop (stop_ntpd in
+# the observed cases), rc force-aborts it, and the WAN-keyed rule installation
+# that should follow NEVER RUNS.
+#
+# The router is then perfectly healthy and every client is dead:
+#   - no MASQUERADE for the active WAN in POSTROUTING, so LAN packets egress
+#     still sourced 192.168.x.x and nothing upstream can route a reply
+#   - VSERVER empty, so every port forward is gone too
+# DNS still works (dnsmasq resolves on the router's behalf, and
+# router-originated traffic already carries the WAN IP) — which is exactly
+# what makes this so confusing to diagnose. Nothing retries. It persists
+# until a full rebuild is forced.
+#
+# WHY A WATCHDOG IS THE ONLY ANSWER: the dual-WAN health check probes
+# wandog_target FROM THE ROUTER, which is genuinely fine throughout. No
+# router-originated probe of any kind — ICMP, DNS, HTTP — can detect this.
+# Only inspecting the rules themselves works.
+#
+# DESIGN RULE: when in doubt, do nothing. Every indeterminate state is a
+# skip, never a heal. A false positive restarts the entire firewall.
+
+VERSION=0.1.0
+TAG=nat-doctor
+
+# --- paths -----------------------------------------------------------------
+# Runtime state lives in /tmp (RAM): never wear JFFS flash with routine writes.
+# ONE thing must survive a reboot — the escalated-reboot timestamp — or an
+# escalation that reboots into the same fault could loop. That file is written
+# at most once per REBOOT_MIN_GAP, so it is not a flash-wear concern.
+RUN=/tmp/nat-doctor
+PERSIST_REBOOT=/jffs/scripts/nat-doctor.reboot
+REBOOT_FLAG=/jffs/scripts/nat-doctor.reboot-ok
+CONF=/jffs/scripts/nat-doctor.conf
+LOCK="$RUN/lock"
+# Overridable ONLY so tests/invariant.sh can stub the netdev namespace.
+# Never set this in production or in $CONF.
+NETDEV_ROOT=${NETDEV_ROOT:-/sys/class/net}
+
+# --- tunables (override in $CONF; the installer must never write that file) --
+COOLDOWN=300            # min seconds between heal attempts
+MAXHEALS=3              # max heals per WINDOW before standing down and shouting
+WINDOW=3600
+RECHECK_WAIT=30         # let restart_firewall settle before re-checking
+REBOOT_MIN_GAP=21600    # 6h minimum between escalated reboots
+
+[ -f "$CONF" ] && . "$CONF"
+
+mkdir -p "$RUN" 2>/dev/null
+
+log() { logger -t "$TAG" "$*"; [ -n "$NATDOC_VERBOSE" ] && echo "$TAG: $*" >&2; }
+say() { echo "$*"; }
+now() { date +%s; }
+read_ts() { [ -f "$1" ] && cat "$1" 2>/dev/null || echo 0; }
+
+# ---------------------------------------------------------------------------
+# Active WAN resolution
+#
+# NEVER hardcode an interface. During a failover to the secondary WAN the
+# active unit may be PPP (pppoe over a USB dongle), where NAT lives on pppN,
+# not on the primary's ethN. A check hardcoded to the primary would see "no
+# MASQUERADE" and restart the firewall EVERY MINUTE for the entire duration of
+# a genuine outage — turning a survivable failover into a catastrophe.
+# This is the most safety-critical function in this script.
+# ---------------------------------------------------------------------------
+active_unit() {
+	_u=$(nvram get wan_primary 2>/dev/null)
+	case "$_u" in 0|1) echo "$_u"; return 0 ;; esac
+	for _u in 0 1; do
+		[ "$(nvram get wan${_u}_primary 2>/dev/null)" = "1" ] && { echo "$_u"; return 0; }
+	done
+	return 1
+}
+
+# Echo the netdev carrying NAT for unit $1, or return 1 if it cannot be
+# determined with confidence (the caller must then SKIP, never heal).
+active_ifname() {
+	_u="$1"
+	case "$(nvram get wan${_u}_proto 2>/dev/null)" in
+		pppoe|pptp|l2tp)
+			# For PPP the netdev is pppN, published as wanX_pppoe_ifname once
+			# the link is up. Empty while down — a skip, not a fault.
+			_if=$(nvram get wan${_u}_pppoe_ifname 2>/dev/null) ;;
+		*)
+			_if=$(nvram get wan${_u}_ifname 2>/dev/null) ;;
+	esac
+	# A serial device is not a network interface: wan1_ifname is /dev/ttyUSB0
+	# on USB-dongle setups. Reject anything that is not a real netdev.
+	case "$_if" in ""|/dev/*) return 1 ;; esac
+	[ -e "$NETDEV_ROOT/$_if" ] || return 1
+	echo "$_if"
+}
+
+masq_present() {
+	iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- "-o $1 -j MASQUERADE"
+}
+
+vserver_rule_count() {
+	_n=$(iptables -t nat -S VSERVER 2>/dev/null | grep -c '^-A')
+	echo "${_n:-0}"
+}
+
+forwards_configured() {
+	[ "$(nvram get vts_enable_x 2>/dev/null)" = "1" ] || return 1
+	[ -n "$(nvram get vts_rulelist 2>/dev/null)" ] || return 1
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# The invariant.
+#   exit 0 = healthy OR indeterminate (take no action)
+#   exit 1 = definitely broken
+# REASON carries the human-readable explanation either way.
+# INDETERMINATE=1 marks "we could not tell" so callers can report honestly.
+# ---------------------------------------------------------------------------
+REASON=""
+INDETERMINATE=0
+check_invariant() {
+	REASON=""; INDETERMINATE=0
+
+	unit=$(active_unit) || {
+		REASON="cannot determine active WAN unit"; INDETERMINATE=1; return 0; }
+
+	state=$(nvram get wan${unit}_state_t 2>/dev/null)
+	if [ "$state" != "2" ]; then
+		REASON="wan${unit}_state_t=$state (WAN not connected) — rules legitimately absent"
+		INDETERMINATE=1; return 0
+	fi
+
+	ifname=$(active_ifname "$unit") || {
+		REASON="cannot determine netdev for wan$unit"; INDETERMINATE=1; return 0; }
+
+	if ! masq_present "$ifname"; then
+		REASON="wan$unit connected on $ifname but no MASQUERADE in POSTROUTING"
+		return 1
+	fi
+
+	# Corroborating trigger. Only meaningful when forwards are actually
+	# configured — an empty VSERVER is correct if the user has none.
+	if forwards_configured && [ "$(vserver_rule_count)" = "0" ]; then
+		REASON="wan$unit connected on $ifname, MASQUERADE present, but VSERVER empty while port forwarding is enabled"
+		return 1
+	fi
+
+	REASON="healthy (wan$unit on $ifname, MASQUERADE present, VSERVER $(vserver_rule_count) rules)"
+	return 0
+}
+
+# --- rate limiting ---------------------------------------------------------
+heals_in_window() {
+	_f="$RUN/healtimes"
+	[ -f "$_f" ] || { echo 0; return; }
+	_cut=$(( $(now) - WINDOW )); _n=0
+	while read -r t; do
+		[ -z "$t" ] && continue
+		[ "$t" -gt "$_cut" ] 2>/dev/null && _n=$((_n + 1))
+	done < "$_f"
+	echo "$_n"
+}
+
+record_heal() {
+	_f="$RUN/healtimes"; _cut=$(( $(now) - WINDOW )); _tmp="$_f.tmp"
+	: > "$_tmp"
+	if [ -f "$_f" ]; then
+		while read -r t; do
+			[ -z "$t" ] && continue
+			[ "$t" -gt "$_cut" ] 2>/dev/null && echo "$t" >> "$_tmp"
+		done < "$_f"
+	fi
+	now >> "$_tmp"; mv "$_tmp" "$_f"; now > "$RUN/lastheal"
+}
+
+# --- healing ---------------------------------------------------------------
+heal() {
+	log "HEAL: $REASON — running 'service restart_firewall'"
+	record_heal
+	service restart_firewall >/dev/null 2>&1
+	sleep "$RECHECK_WAIT"
+
+	if check_invariant && [ "$INDETERMINATE" = "0" ]; then
+		log "HEAL OK: $REASON"
+		return 0
+	fi
+	if [ "$INDETERMINATE" = "1" ]; then
+		log "HEAL INCONCLUSIVE: $REASON"
+		return 1
+	fi
+
+	log "HEAL FAILED: still broken after restart_firewall — $REASON"
+
+	if [ ! -f "$REBOOT_FLAG" ]; then
+		log "ESCALATION DISABLED: create $REBOOT_FLAG to permit reboot escalation. Manual action required."
+		return 1
+	fi
+	_age=$(( $(now) - $(read_ts "$PERSIST_REBOOT") ))
+	if [ "$_age" -lt "$REBOOT_MIN_GAP" ]; then
+		log "ESCALATION SUPPRESSED: last escalated reboot ${_age}s ago (< $REBOOT_MIN_GAP). Manual action required."
+		return 1
+	fi
+
+	log "ESCALATING: rebooting (restart_firewall did not resolve the fault)"
+	now > "$PERSIST_REBOOT"
+	sync
+	reboot
+	return 1
+}
+
+# --- subcommands -----------------------------------------------------------
+cmd_check() {
+	if check_invariant; then
+		[ "$INDETERMINATE" = "1" ] && { say "UNKNOWN: $REASON"; return 2; }
+		say "OK: $REASON"; return 0
+	fi
+	say "BROKEN: $REASON"; return 1
+}
+
+cmd_status() {
+	unit=$(active_unit) || unit="?"
+	say "nat-doctor $VERSION"
+	say ""
+	say "active WAN unit   : $unit"
+	say "proto             : $(nvram get wan${unit}_proto 2>/dev/null)"
+	say "state_t           : $(nvram get wan${unit}_state_t 2>/dev/null) (2 = connected)"
+	say "netdev            : $(active_ifname "$unit" 2>/dev/null || echo '<undetermined>')"
+	say "port forwarding   : $(forwards_configured && echo enabled || echo 'disabled/none')"
+	say "VSERVER rules     : $(vserver_rule_count)"
+	say ""
+	say "POSTROUTING:"
+	iptables -t nat -S POSTROUTING 2>/dev/null | sed 's/^/  /'
+	say ""
+	say "last heal         : $(read_ts "$RUN/lastheal")"
+	say "heals in window   : $(heals_in_window)/$MAXHEALS (last ${WINDOW}s)"
+	say "last esc. reboot  : $(read_ts "$PERSIST_REBOOT")"
+	say "reboot escalation : $([ -f "$REBOOT_FLAG" ] && echo enabled || echo 'disabled (default)')"
+	say "watchdog cron     : $(cru l 2>/dev/null | grep -c nat-doctor-wd) entry/entries"
+	say ""
+	cmd_check
+}
+
+cmd_log() {
+	if [ -f /tmp/syslog.log ]; then
+		grep "$TAG" /tmp/syslog.log | tail -40
+	else
+		logread 2>/dev/null | grep "$TAG" | tail -40
+	fi
+}
+
+cmd_watchdog() {
+	# Single instance. A heal takes RECHECK_WAIT seconds while cron fires every
+	# minute; overlapping runs must never stack restart_firewall calls.
+	# PID + /proc, never `ps | grep` — a broad grep can match the calling SSH
+	# session (see AGENTS.md).
+	if [ -f "$LOCK" ]; then
+		_pid=$(cat "$LOCK" 2>/dev/null)
+		[ -n "$_pid" ] && [ -d "/proc/$_pid" ] && return 0
+	fi
+	echo $$ > "$LOCK"
+	trap 'rm -f "$LOCK"' EXIT INT TERM
+
+	check_invariant && return 0
+
+	_since=$(( $(now) - $(read_ts "$RUN/lastheal") ))
+	if [ "$_since" -lt "$COOLDOWN" ]; then
+		log "SKIP: broken ($REASON) but last heal ${_since}s ago (< $COOLDOWN)"
+		return 0
+	fi
+	_n=$(heals_in_window)
+	if [ "$_n" -ge "$MAXHEALS" ]; then
+		log "STANDING DOWN: $_n heals in ${WINDOW}s and still broken ($REASON). Manual action required."
+		return 1
+	fi
+	heal
+}
+
+case "$1" in
+	check)    cmd_check ;;
+	status)   cmd_status ;;
+	log)      cmd_log ;;
+	watchdog) cmd_watchdog ;;
+	heal)     check_invariant; heal ;;
+	version)  say "nat-doctor $VERSION" ;;
+	*)
+		say "natctl $VERSION — nat-doctor for Asuswrt-Merlin"
+		say ""
+		say "usage: natctl {check|status|log|watchdog|heal|version}"
+		say ""
+		say "  check     report the invariant, take no action (0=ok 1=broken 2=unknown)"
+		say "  status    full diagnostic dump + check"
+		say "  log       recent nat-doctor syslog lines"
+		say "  watchdog  cron entrypoint: check, heal if broken, escalate if permitted"
+		say "  heal      force a heal attempt now (ignores cooldown)"
+		exit 2 ;;
+esac
