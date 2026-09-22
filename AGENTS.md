@@ -160,6 +160,41 @@ any of these on another model:
   client off until it is restored. Only do that with physical access to the
   router, and never on someone else's network.
 
+## TODO — unverified repair commands
+
+`samba`, `upnp` and `ntpd` ship **disabled** because their repair commands
+have never been executed. Do not enable any of them by default until it has
+been verified the same way `restart_dnsmasq` was:
+
+```sh
+# on the router, for each candidate
+BEFORE=$(pidof <proc> | tr ' ' '\n' | sort -n | head -1)
+service restart_<name>
+sleep 4
+AFTER=$(pidof <proc> | tr ' ' '\n' | sort -n | head -1)
+# valid  = AFTER non-empty AND != BEFORE
+# no-op  = AFTER == BEFORE          (command probably not recognised)
+# UNSAFE = AFTER empty              (it stopped the service and never started it)
+```
+
+That last outcome is the one that matters: a "repair" that stops a service
+without restarting it turns the watchdog into the outage.
+
+| Check | Repair to verify | Process | Hazard while testing |
+|---|---|---|---|
+| `samba` | `restart_samba` | `smbd` | drops in-flight SMB transfers |
+| `upnp` | `restart_upnp` | `miniupnpd` | drops active UPnP port mappings |
+| `ntpd` | `restart_ntpd` | `ntp` | `stop_ntpd` is the service that wedges — test only on an idle, healthy router, never near an incident |
+
+Testing requires physical or LAN access, since a bad outcome can sever remote
+access. `ntpd` additionally needs a judgement call about whether it belongs
+here at all: a stale clock is an annoyance, not an outage, and it is the one
+repair plausibly capable of re-entering the very hang this tool exists for.
+
+Also unverified: whether `dnsmasq`'s `sw_mode` gate behaves correctly on a
+router in AP or repeater mode. The fixtures pin the intended logic, but no
+non-router deployment has been observed.
+
 ## Release checklist
 
 Bump `VERSION` in `scripts/natctl` in the release commit, then tag `vX.Y.Z`

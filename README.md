@@ -141,12 +141,23 @@ enabled      whether you want it watched         (HEAL_CHECKS)
 | `firewall` | WAN `state_t=2` | no `MASQUERADE` for the active WAN, or `VSERVER` empty while forwarding is on | `restart_firewall` |
 | `wireguard` | `wgs_enable=1` | `wgs${wgs_unit}` interface absent | `restart_wgs` |
 | `dnsmasq` | `sw_mode=1` | no `dnsmasq` process | `restart_dnsmasq` |
-| `samba` | `enable_samba=1` | no `smbd` | `restart_samba` |
-| `upnp` | `upnp_enable=1` | no `miniupnpd` | `restart_upnp` |
-| `ntpd` | — | no `ntp` process | `restart_ntpd` |
+| `samba` | `enable_samba=1` | no `smbd` | `restart_samba` ⚠️ |
+| `upnp` | `upnp_enable=1` | no `miniupnpd` | `restart_upnp` ⚠️ |
+| `ntpd` | — | no `ntp` process | `restart_ntpd` ⚠️ |
 
-Default active: `firewall wireguard dnsmasq` — the three with confirmed
-failure modes. The rest are opt-in.
+Default active: **`firewall wireguard dnsmasq`** — the three whose repair
+commands have been executed on a real router and confirmed to work, and the
+three with observed or documented failure modes.
+
+⚠️ **The opt-in three are untested.** Their repair commands have never been
+run. They appear in a `strings` dump of `/sbin/rc`, but that dump is
+unreliable — `restart_firewall` and `restart_wgs` are missing from it and both
+work — so presence there is not evidence. Enabling one means its first real
+execution would be during an outage. Each also carries its own hazard:
+restarting Samba drops in-flight transfers, restarting UPnP drops active port
+mappings, and `stop_ntpd` is *the service that wedges*, so poking ntpd around
+a wedge is the repair most likely to re-enter the hang. See
+[AGENTS.md](AGENTS.md) for what verifying them would involve.
 
 **`should_run` comes from what nvram declares, never from what's running.**
 If you have deliberately disabled WireGuard, its absence is *correct* and
