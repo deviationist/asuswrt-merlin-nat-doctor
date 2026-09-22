@@ -23,7 +23,8 @@ cru d "$CRU_ID" 2>/dev/null
 rm -f "$DEST/natctl" \
       "$DEST/nat-doctor.conf" \
       "$DEST/nat-doctor.reboot" \
-      "$DEST/nat-doctor.reboot-ok"
+      "$DEST/nat-doctor.reboot-ok" \
+      "$DEST/nat-doctor.history"
 rm -rf /tmp/nat-doctor
 
 logger -t nat-doctor "uninstalled" 2>/dev/null

@@ -36,7 +36,7 @@
 # deliberately disabled must never be "repaired" — that would fight their
 # configuration every minute forever.
 
-VERSION=0.2.0
+VERSION=0.3.0
 TAG=nat-doctor
 
 # --- paths -----------------------------------------------------------------
@@ -47,6 +47,14 @@ TAG=nat-doctor
 RUN=/tmp/nat-doctor
 PERSIST_REBOOT=/jffs/scripts/nat-doctor.reboot
 REBOOT_FLAG=/jffs/scripts/nat-doctor.reboot-ok
+# Durable record of repairs. `logger` goes to syslog, which rotates in about a
+# day on a busy router — so a heal at 3am could be gone before anyone looks,
+# and the watchdog would have no way to show it ever did anything. This file
+# is the second exception to "no routine writes to /jffs": it is appended ONLY
+# when a repair actually happens (never on a healthy check), and trimmed to
+# HISTORY_MAX lines. In normal operation that is a handful of lines a month.
+HISTORY=/jffs/scripts/nat-doctor.history
+HISTORY_MAX=200
 CONF=/jffs/scripts/nat-doctor.conf
 LOCK="$RUN/lock"
 # Overridable ONLY so tests/ can stub the netdev namespace.
@@ -78,6 +86,20 @@ LOCK_STALE=600          # a lock older than this means the holder is hung
 mkdir -p "$RUN" 2>/dev/null
 
 log() { logger -t "$TAG" "$*"; [ -n "$NATDOC_VERBOSE" ] && echo "$TAG: $*" >&2; }
+
+# hist <check> <event> <detail...> — append one line to the durable history and
+# trim. Call ONLY for things worth surviving a syslog rotation: repairs and
+# their outcomes, escalations, stand-downs. Never for a healthy check.
+hist() {
+	_hc="$1"; _he="$2"; shift 2
+	printf '%s\t%-9s %-16s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$_hc" "$_he" "$*" >> "$HISTORY" 2>/dev/null || return 0
+	# Trim in place. Rare enough (repairs only) that a full rewrite is fine.
+	_hl=$(wc -l < "$HISTORY" 2>/dev/null || echo 0)
+	if [ "$_hl" -gt "$HISTORY_MAX" ] 2>/dev/null; then
+		tail -n "$HISTORY_MAX" "$HISTORY" > "$HISTORY.tmp" 2>/dev/null && mv "$HISTORY.tmp" "$HISTORY"
+	fi
+}
+
 say() { echo "$*"; }
 now() { date +%s; }
 read_ts() { [ -f "$1" ] && cat "$1" 2>/dev/null || echo 0; }
@@ -316,16 +338,19 @@ record_heal() {
 # repair_check <name> — assumes STATE=broken and rate limits already cleared
 repair_check() {
 	_n="$1"
+	_detected="$WHY"
 	log "REPAIR[$_n]: $WHY — running repair"
+	hist "$_n" "DETECTED" "$_detected"
 	record_heal "$_n"
 	repair_"$_n"
 	sleep "$RECHECK_WAIT"
 	run_check "$_n"
 	case "$STATE" in
-		ok)   log "REPAIR OK[$_n]: $WHY"; return 0 ;;
-		skip) log "REPAIR INCONCLUSIVE[$_n]: $WHY"; return 1 ;;
+		ok)   log "REPAIR OK[$_n]: $WHY"; hist "$_n" "REPAIRED" "$WHY"; return 0 ;;
+		skip) log "REPAIR INCONCLUSIVE[$_n]: $WHY"; hist "$_n" "INCONCLUSIVE" "$WHY"; return 1 ;;
 	esac
 	log "REPAIR FAILED[$_n]: still broken — $WHY"
+	hist "$_n" "FAILED" "still broken after repair — $WHY"
 
 	# Reboot escalation is deliberately tied to the firewall check only: it is
 	# the one whose failure takes the entire LAN offline, and rebooting for a
@@ -334,14 +359,17 @@ repair_check() {
 
 	if [ ! -f "$REBOOT_FLAG" ]; then
 		log "ESCALATION DISABLED: create $REBOOT_FLAG to permit reboot escalation. Manual action required."
+		hist "$_n" "NEEDS-HUMAN" "repair failed; reboot escalation is disabled"
 		return 1
 	fi
 	_age=$(( $(now) - $(read_ts "$PERSIST_REBOOT") ))
 	if [ "$_age" -lt "$REBOOT_MIN_GAP" ]; then
 		log "ESCALATION SUPPRESSED: last escalated reboot ${_age}s ago (< $REBOOT_MIN_GAP). Manual action required."
+		hist "$_n" "NEEDS-HUMAN" "repair failed; reboot suppressed (last was ${_age}s ago)"
 		return 1
 	fi
 	log "ESCALATING: rebooting (restart_firewall did not resolve the fault)"
+	hist "$_n" "REBOOTING" "repair did not resolve the fault; escalating to reboot"
 	now > "$PERSIST_REBOOT"; sync; reboot
 	return 1
 }
@@ -389,6 +417,13 @@ cmd_status() {
 	say "last esc. reboot  : $(read_ts "$PERSIST_REBOOT")"
 	say "reboot escalation : $([ -f "$REBOOT_FLAG" ] && echo enabled || echo 'disabled (default)')"
 	say "watchdog cron     : $(cru l 2>/dev/null | grep -c nat-doctor-wd) entry/entries"
+	if [ -s "$HISTORY" ]; then
+		say ""
+		say "recent repairs (natctl history for all):"
+		tail -3 "$HISTORY" | sed 's/^/  /'
+	else
+		say "repairs recorded  : none since install"
+	fi
 	say ""
 	cmd_check
 }
@@ -396,6 +431,25 @@ cmd_status() {
 cmd_log() {
 	if [ -f /tmp/syslog.log ]; then grep "$TAG" /tmp/syslog.log | tail -40
 	else logread 2>/dev/null | grep "$TAG" | tail -40; fi
+}
+
+# The durable record. Unlike `log`, this survives syslog rotation — which is
+# the only way to answer "has this thing ever actually done anything?" weeks
+# after the fact.
+cmd_history() {
+	if [ ! -s "$HISTORY" ]; then
+		say "No repairs recorded."
+		say ""
+		say "That is the expected state: nat-doctor writes here ONLY when it"
+		say "actually repairs something, never on a healthy check. An empty"
+		say "history means the fault has not occurred since installation."
+		return 0
+	fi
+	say "Repairs recorded in $HISTORY (newest last):"
+	say ""
+	cat "$HISTORY"
+	say ""
+	say "$(grep -c 'REPAIRED' "$HISTORY" 2>/dev/null) successful repair(s), $(grep -c 'FAILED\|NEEDS-HUMAN\|STAND-DOWN' "$HISTORY" 2>/dev/null) needing attention."
 }
 
 cmd_watchdog() {
@@ -439,6 +493,7 @@ cmd_watchdog() {
 		_n=$(heals_in_window "$c")
 		if [ "$_n" -ge "$MAXHEALS" ]; then
 			log "STANDING DOWN[$c]: $_n repairs in ${WINDOW}s and still broken ($WHY). Manual action required."
+			hist "$c" "STAND-DOWN" "$_n repairs in ${WINDOW}s, still broken — $WHY"
 			continue
 		fi
 		repair_check "$c"
@@ -462,17 +517,19 @@ case "$1" in
 	check)    cmd_check ;;
 	status)   cmd_status ;;
 	log)      cmd_log ;;
+	history)  cmd_history ;;
 	watchdog) cmd_watchdog ;;
 	heal)     cmd_heal "$2" ;;
 	version)  say "nat-doctor $VERSION" ;;
 	*)
 		say "natctl $VERSION — nat-doctor for Asuswrt-Merlin"
 		say ""
-		say "usage: natctl {check|status|log|watchdog|heal [check]|version}"
+		say "usage: natctl {check|status|log|history|watchdog|heal [check]|version}"
 		say ""
 		say "  check       report every active check (0=all ok 1=broken 2=some unknown)"
 		say "  status      full diagnostic dump + check"
-		say "  log         recent nat-doctor syslog lines"
+		say "  log         recent nat-doctor syslog lines (rotates in ~1 day)"
+		say "  history     durable record of every repair ever made"
 		say "  watchdog    cron entrypoint: check each, repair what is broken"
 		say "  heal [name] force a repair now (ignores cooldown); optionally one check"
 		say ""

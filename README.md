@@ -18,10 +18,15 @@ The bug is in **stock AsusWRT's closed-source service manager**, so
 [Asuswrt-Merlin](https://www.asuswrt-merlin.net/) and stock firmware are
 equally affected, and it has been reported across the Wi-Fi 7 line.
 
-**This repo is the doctor.** A cron-driven watchdog that checks one thing
-every minute — *does the active WAN actually have a NAT rule?* — and repairs
-the firewall when the answer is no. No daemon, no dependencies, ~20 lines of
-actual logic wrapped in a lot of care about not making things worse.
+**This repo is the doctor.** A cron-driven watchdog that asks, every minute,
+whether the things the router *says* should be running actually are — the WAN's
+NAT rules, the port forwards, the WireGuard server, dnsmasq — and repairs
+whichever the failed rebuild left behind. No daemon, no dependencies; a small
+amount of logic wrapped in a lot of care about not making things worse.
+
+There's also a [read-only probe](#am-i-actually-hitting-this-bug) that tells
+you whether you're hitting this at all, including whether it has happened
+before on your router.
 
 ## In plain words — what this bug feels like
 
@@ -109,11 +114,30 @@ boot hook so the watchdog survives reboots, and prints a status report.
 ```
 natctl status        # active WAN, netdev, rules, per-check counters, + check
 natctl check         # every active check — exit 0=all ok 1=broken 2=some unknown
-natctl log           # what it has detected and repaired
+natctl log           # recent syslog lines (rotates in ~1 day)
+natctl history       # durable record of every repair ever made
 natctl heal [check]  # force a repair now (ignores cooldown); optionally just one
 natctl watchdog      # the cron entrypoint
 natctl version
 ```
+
+### "How do I know it's actually doing anything?"
+
+A watchdog that works is invisible, which makes it hard to trust. `natctl log`
+reads syslog — but syslog rotates in about a day on a busy router, so a repair
+at 3am on a Tuesday can be gone before you ever look.
+
+So repairs are also appended to `/jffs/scripts/nat-doctor.history`, which
+survives rotation and reboots:
+
+```
+2026-09-22 21:03:00	firewall  DETECTED   wan0 connected on eth0 but no MASQUERADE in POSTROUTING
+2026-09-22 21:03:30	firewall  REPAIRED   wan0 on eth0, MASQUERADE present, VSERVER 10 rules
+```
+
+It is written **only** when a repair actually happens — never on a healthy
+check — so an empty history is the good outcome, not a broken one. `natctl
+history` prints it with a count of repairs versus events that needed a human.
 
 ## How it decides
 
@@ -232,6 +256,7 @@ Every artifact, for manual removal or audit:
 | `/jffs/scripts/natctl` | the script |
 | `/jffs/scripts/nat-doctor.conf` | user tunables (optional) |
 | `/jffs/scripts/nat-doctor.reboot` | escalated-reboot timestamp (persistent by design) |
+| `/jffs/scripts/nat-doctor.history` | durable repair record (persistent by design) |
 | `/jffs/scripts/nat-doctor.reboot-ok` | reboot-escalation opt-in flag |
 | `/jffs/scripts/services-start` | one `cru a nat-doctor-wd …` line |
 | `/jffs/configs/profile.add` | one `alias natctl=…` line |
@@ -252,7 +277,24 @@ they still have teeth.
 
 ## Am I actually hitting this bug?
 
-While the symptoms are present, on the router:
+**The quick way** — run the probe on the router. Read-only, changes nothing,
+safe at any time:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/deviationist/asuswrt-merlin-nat-doctor/main/extras/nat-fault-probe.sh | sh
+```
+
+It answers two questions separately: is the fault active *right now*, and has
+it happened *before* in whatever log history survives. The second matters
+because this fault is self-concealing — the router looks healthy afterwards,
+and a reboot erases the live evidence, leaving only the syslog signature.
+
+It also prints your `wandog` threshold, so you can see exactly how short a WAN
+outage has to be on *your* router to take the dangerous path.
+
+Output is copy-pasteable into a bug report.
+
+**Manually**, while the symptoms are present, on the router:
 
 ```sh
 nvram get wan0_state_t                      # 2 = connected

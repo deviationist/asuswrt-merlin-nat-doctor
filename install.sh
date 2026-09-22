@@ -28,7 +28,7 @@ if [ "$1" = "uninstall" ]; then
   cru d "$CRU_ID" 2>/dev/null
   [ -f "$SS" ] && sed -i "/$CRU_ID/d" "$SS"
   [ -f "$PROFILE" ] && sed -i "/^alias natctl=.*nat-doctor/d" "$PROFILE"
-  rm -f "$DEST/natctl" "$DEST/nat-doctor.conf" "$DEST/nat-doctor.reboot" "$DEST/nat-doctor.reboot-ok"
+  rm -f "$DEST/natctl" "$DEST/nat-doctor.conf" "$DEST/nat-doctor.reboot" "$DEST/nat-doctor.reboot-ok" "$DEST/nat-doctor.history"
   rm -rf /tmp/nat-doctor
   echo "nat-doctor uninstalled."
   echo "(the 'natctl' alias stays live in THIS shell until you log out)"
