@@ -7,49 +7,71 @@
 # instead by udhcpc's lightweight re-init path, which serialises through a
 # single-slot rc_service queue. With only a few seconds between the down and
 # up events the two sequences collide, a service wedges on stop (stop_ntpd in
-# the observed cases), rc force-aborts it, and the WAN-keyed rule installation
-# that should follow NEVER RUNS.
+# every case observed so far), rc force-aborts it, and EVERYTHING THE CASCADE
+# HAD NOT YET DONE NEVER HAPPENS.
 #
-# The router is then perfectly healthy and every client is dead:
-#   - no MASQUERADE for the active WAN in POSTROUTING, so LAN packets egress
-#     still sourced 192.168.x.x and nothing upstream can route a reply
-#   - VSERVER empty, so every port forward is gone too
-# DNS still works (dnsmasq resolves on the router's behalf, and
-# router-originated traffic already carries the WAN IP) — which is exactly
-# what makes this so confusing to diagnose. Nothing retries. It persists
-# until a full rebuild is forced.
+# The WAN-up cascade is a sequence of stop/start pairs, roughly:
+#   nat-start -> firewall-start -> ntpd -> WireGuard server -> samba
+#   -> dnsmasq -> DDNS -> dhcp renew
+# A wedge strands whatever pair it died inside, so the damage varies per
+# incident. Observed on one RT-BE92U:
+#   2026-09-13 - died after WireGuard restarted: NAT rules missing
+#   2026-09-22 - died after "WireGuard: Stopping server": NAT rules missing
+#                AND the wgs1 interface never came back (total VPN lockout)
+#
+# The router is left healthy by every measure it has — state_t=2, GUI green,
+# its own traffic and DNS fine — while clients are cut off. Nothing retries.
 #
 # WHY A WATCHDOG IS THE ONLY ANSWER: the dual-WAN health check probes
 # wandog_target FROM THE ROUTER, which is genuinely fine throughout. No
-# router-originated probe of any kind — ICMP, DNS, HTTP — can detect this.
-# Only inspecting the rules themselves works.
+# router-originated probe of any kind can detect this. Only inspecting the
+# resulting state works.
 #
-# DESIGN RULE: when in doubt, do nothing. Every indeterminate state is a
-# skip, never a heal. A false positive restarts the entire firewall.
+# DESIGN RULE: when in doubt, do nothing. Every check answers THREE
+# questions, and only acts when all three are unambiguous:
+#   should_run  - what the router's own config DECLARES (nvram)
+#   is_ok       - observable reality
+#   enabled     - whether the operator wants us watching this (HEAL_CHECKS)
+# If should_run cannot be determined, that is a SKIP. A service the user has
+# deliberately disabled must never be "repaired" — that would fight their
+# configuration every minute forever.
 
-VERSION=0.1.0
+VERSION=0.2.0
 TAG=nat-doctor
 
 # --- paths -----------------------------------------------------------------
 # Runtime state lives in /tmp (RAM): never wear JFFS flash with routine writes.
 # ONE thing must survive a reboot — the escalated-reboot timestamp — or an
-# escalation that reboots into the same fault could loop. That file is written
-# at most once per REBOOT_MIN_GAP, so it is not a flash-wear concern.
+# escalation that reboots into the same fault could loop. Written at most once
+# per REBOOT_MIN_GAP, so not a flash-wear concern.
 RUN=/tmp/nat-doctor
 PERSIST_REBOOT=/jffs/scripts/nat-doctor.reboot
 REBOOT_FLAG=/jffs/scripts/nat-doctor.reboot-ok
 CONF=/jffs/scripts/nat-doctor.conf
 LOCK="$RUN/lock"
-# Overridable ONLY so tests/invariant.sh can stub the netdev namespace.
-# Never set this in production or in $CONF.
+# Overridable ONLY so tests/ can stub the netdev namespace.
 NETDEV_ROOT=${NETDEV_ROOT:-/sys/class/net}
 
 # --- tunables (override in $CONF; the installer must never write that file) --
-COOLDOWN=300            # min seconds between heal attempts
-MAXHEALS=3              # max heals per WINDOW before standing down and shouting
+# Which checks are active. Defaults are the three with confirmed failure
+# modes; the rest are opt-in because every extra check is another thing that
+# can misfire. Available: firewall wireguard dnsmasq samba ntpd upnp
+HEAL_CHECKS="firewall wireguard dnsmasq"
+
+COOLDOWN=300            # min seconds between repair attempts, PER CHECK
+MAXHEALS=3              # max repairs per WINDOW per check, then stand down
 WINDOW=3600
-RECHECK_WAIT=30         # let restart_firewall settle before re-checking
+RECHECK_WAIT=30         # let a repair settle before re-checking
 REBOOT_MIN_GAP=21600    # 6h minimum between escalated reboots
+
+# Bounds on a single run. These exist because our repairs call `service`,
+# which goes through notify_rc into the SAME rc_service queue whose wedging
+# causes this fault. If we ever repair while that queue is stuck, the call can
+# hang forever — and a hung run holding the lock means the watchdog silently
+# stops protecting anything. Never remove these.
+REPAIR_TIMEOUT=60       # hard kill a repair command that hangs this long
+MAX_RUN=240             # abandon the whole run after this many seconds
+LOCK_STALE=600          # a lock older than this means the holder is hung
 
 [ -f "$CONF" ] && . "$CONF"
 
@@ -59,17 +81,45 @@ log() { logger -t "$TAG" "$*"; [ -n "$NATDOC_VERBOSE" ] && echo "$TAG: $*" >&2; 
 say() { echo "$*"; }
 now() { date +%s; }
 read_ts() { [ -f "$1" ] && cat "$1" 2>/dev/null || echo 0; }
+have_proc() { [ -n "$(pidof "$1" 2>/dev/null)" ]; }
 
-# ---------------------------------------------------------------------------
-# Active WAN resolution
+# run_limited <seconds> <command...> — busybox has no `timeout` applet, so
+# supervise it by hand. Returns 124 if the command had to be killed.
+# Killing our `service` invocation does not unwedge rc_service, but it frees
+# the watchdog, which is the whole point.
+run_limited() {
+	_lim="$1"; shift
+	"$@" &
+	_rp=$!
+	_i=0
+	while [ "$_i" -lt "$_lim" ]; do
+		kill -0 "$_rp" 2>/dev/null || { wait "$_rp"; return $?; }
+		sleep 1
+		_i=$((_i + 1))
+	done
+	log "TIMEOUT: repair command exceeded ${_lim}s — killing pid $_rp (rc_service may be wedged)"
+	kill -TERM "$_rp" 2>/dev/null
+	sleep 2
+	kill -KILL "$_rp" 2>/dev/null
+	return 124
+}
+
+# Seconds since this run started; used to enforce MAX_RUN.
+RUN_START=$(date +%s)
+run_elapsed() { echo $(( $(date +%s) - RUN_START )); }
+
+# Every repair goes through here, so every repair is bounded.
+svc() { run_limited "$REPAIR_TIMEOUT" service "$1" >/dev/null 2>&1; }
+
+# ===========================================================================
+# CHECK: firewall — the NAT rule set
+# ===========================================================================
 #
 # NEVER hardcode an interface. During a failover to the secondary WAN the
 # active unit may be PPP (pppoe over a USB dongle), where NAT lives on pppN,
 # not on the primary's ethN. A check hardcoded to the primary would see "no
 # MASQUERADE" and restart the firewall EVERY MINUTE for the entire duration of
-# a genuine outage — turning a survivable failover into a catastrophe.
-# This is the most safety-critical function in this script.
-# ---------------------------------------------------------------------------
+# a genuine outage. The most safety-critical function in this script.
 active_unit() {
 	_u=$(nvram get wan_primary 2>/dev/null)
 	case "$_u" in 0|1) echo "$_u"; return 0 ;; esac
@@ -80,13 +130,13 @@ active_unit() {
 }
 
 # Echo the netdev carrying NAT for unit $1, or return 1 if it cannot be
-# determined with confidence (the caller must then SKIP, never heal).
+# determined with confidence (the caller must then SKIP, never repair).
 active_ifname() {
 	_u="$1"
 	case "$(nvram get wan${_u}_proto 2>/dev/null)" in
 		pppoe|pptp|l2tp)
-			# For PPP the netdev is pppN, published as wanX_pppoe_ifname once
-			# the link is up. Empty while down — a skip, not a fault.
+			# For PPP the netdev is pppN, published once the link is up.
+			# Empty while down — a skip, not a fault.
 			_if=$(nvram get wan${_u}_pppoe_ifname 2>/dev/null) ;;
 		*)
 			_if=$(nvram get wan${_u}_ifname 2>/dev/null) ;;
@@ -98,64 +148,150 @@ active_ifname() {
 	echo "$_if"
 }
 
-masq_present() {
-	iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- "-o $1 -j MASQUERADE"
-}
-
-vserver_rule_count() {
-	_n=$(iptables -t nat -S VSERVER 2>/dev/null | grep -c '^-A')
-	echo "${_n:-0}"
-}
-
+masq_present() { iptables -t nat -S POSTROUTING 2>/dev/null | grep -q -- "-o $1 -j MASQUERADE"; }
+vserver_rule_count() { _n=$(iptables -t nat -S VSERVER 2>/dev/null | grep -c '^-A'); echo "${_n:-0}"; }
 forwards_configured() {
 	[ "$(nvram get vts_enable_x 2>/dev/null)" = "1" ] || return 1
 	[ -n "$(nvram get vts_rulelist 2>/dev/null)" ] || return 1
 	return 0
 }
 
-# ---------------------------------------------------------------------------
-# The invariant.
-#   exit 0 = healthy OR indeterminate (take no action)
-#   exit 1 = definitely broken
-# REASON carries the human-readable explanation either way.
-# INDETERMINATE=1 marks "we could not tell" so callers can report honestly.
-# ---------------------------------------------------------------------------
-REASON=""
-INDETERMINATE=0
-check_invariant() {
-	REASON=""; INDETERMINATE=0
-
-	unit=$(active_unit) || {
-		REASON="cannot determine active WAN unit"; INDETERMINATE=1; return 0; }
-
-	state=$(nvram get wan${unit}_state_t 2>/dev/null)
-	if [ "$state" != "2" ]; then
-		REASON="wan${unit}_state_t=$state (WAN not connected) — rules legitimately absent"
-		INDETERMINATE=1; return 0
-	fi
-
-	ifname=$(active_ifname "$unit") || {
-		REASON="cannot determine netdev for wan$unit"; INDETERMINATE=1; return 0; }
-
-	if ! masq_present "$ifname"; then
-		REASON="wan$unit connected on $ifname but no MASQUERADE in POSTROUTING"
-		return 1
-	fi
-
-	# Corroborating trigger. Only meaningful when forwards are actually
-	# configured — an empty VSERVER is correct if the user has none.
-	if forwards_configured && [ "$(vserver_rule_count)" = "0" ]; then
-		REASON="wan$unit connected on $ifname, MASQUERADE present, but VSERVER empty while port forwarding is enabled"
-		return 1
-	fi
-
-	REASON="healthy (wan$unit on $ifname, MASQUERADE present, VSERVER $(vserver_rule_count) rules)"
+# should_run: 0 = yes, 1 = no (intentionally), 2 = cannot tell
+should_run_firewall() {
+	unit=$(active_unit) || { SR_WHY="cannot determine active WAN unit"; return 2; }
+	_st=$(nvram get wan${unit}_state_t 2>/dev/null)
+	[ "$_st" = "2" ] || { SR_WHY="wan${unit}_state_t=$_st (WAN not connected) — rules legitimately absent"; return 1; }
+	ifname=$(active_ifname "$unit") || { SR_WHY="cannot determine netdev for wan$unit"; return 2; }
 	return 0
 }
 
-# --- rate limiting ---------------------------------------------------------
+is_ok_firewall() {
+	if ! masq_present "$ifname"; then
+		OK_WHY="wan$unit connected on $ifname but no MASQUERADE in POSTROUTING"; return 1
+	fi
+	if forwards_configured && [ "$(vserver_rule_count)" = "0" ]; then
+		OK_WHY="wan$unit on $ifname, MASQUERADE present, but VSERVER empty while port forwarding is enabled"; return 1
+	fi
+	OK_WHY="wan$unit on $ifname, MASQUERADE present, VSERVER $(vserver_rule_count) rules"
+	return 0
+}
+
+repair_firewall() { svc restart_firewall; }
+
+# ===========================================================================
+# CHECK: wireguard — the WireGuard *server*
+# ===========================================================================
+# 2026-09-22: the cascade died at "WireGuard: Stopping server" with no
+# matching start, leaving wgs1 nonexistent and the operator locked out.
+# restart_firewall does NOT fix this — it rebuilds iptables, not interfaces.
+wgs_iface() {
+	_u=$(nvram get wgs_unit 2>/dev/null)
+	case "$_u" in ''|*[!0-9]*) return 1 ;; esac
+	echo "wgs$_u"
+}
+
+should_run_wireguard() {
+	_en=$(nvram get wgs_enable 2>/dev/null)
+	case "$_en" in
+		1) ;;
+		0) SR_WHY="wgs_enable=0 — WireGuard server deliberately off"; return 1 ;;
+		*) SR_WHY="wgs_enable unreadable"; return 2 ;;
+	esac
+	wgif=$(wgs_iface) || { SR_WHY="wgs_unit unreadable"; return 2; }
+	return 0
+}
+
+is_ok_wireguard() {
+	if wg show "$wgif" >/dev/null 2>&1; then
+		OK_WHY="$wgif up"; return 0
+	fi
+	OK_WHY="wgs_enable=1 but interface $wgif does not exist"; return 1
+}
+
+repair_wireguard() { svc restart_wgs; }
+
+# ===========================================================================
+# CHECK: dnsmasq — DNS/DHCP for the whole LAN
+# ===========================================================================
+# There is no dnsmasq_enable nvram key, so intent is inferred from sw_mode:
+# only a router (sw_mode=1) is expected to run it. Anything else — or an
+# unreadable value — is a skip, not a guess.
+should_run_dnsmasq() {
+	_m=$(nvram get sw_mode 2>/dev/null)
+	case "$_m" in
+		1) return 0 ;;
+		2|3) SR_WHY="sw_mode=$_m (not router mode)"; return 1 ;;
+		*) SR_WHY="sw_mode unreadable"; return 2 ;;
+	esac
+}
+
+is_ok_dnsmasq() {
+	if have_proc dnsmasq; then OK_WHY="dnsmasq running"; return 0; fi
+	OK_WHY="sw_mode=1 but no dnsmasq process"; return 1
+}
+
+repair_dnsmasq() { svc restart_dnsmasq; }
+
+# ===========================================================================
+# Opt-in checks
+# ===========================================================================
+should_run_samba() {
+	case "$(nvram get enable_samba 2>/dev/null)" in
+		1) return 0 ;; 0) SR_WHY="enable_samba=0"; return 1 ;;
+		*) SR_WHY="enable_samba unreadable"; return 2 ;;
+	esac
+}
+is_ok_samba() {
+	have_proc smbd && { OK_WHY="smbd running"; return 0; }
+	OK_WHY="enable_samba=1 but no smbd process"; return 1
+}
+repair_samba() { svc restart_samba; }
+
+should_run_upnp() {
+	case "$(nvram get upnp_enable 2>/dev/null)" in
+		1) return 0 ;; 0) SR_WHY="upnp_enable=0"; return 1 ;;
+		*) SR_WHY="upnp_enable unreadable"; return 2 ;;
+	esac
+}
+is_ok_upnp() {
+	have_proc miniupnpd && { OK_WHY="miniupnpd running"; return 0; }
+	OK_WHY="upnp_enable=1 but no miniupnpd process"; return 1
+}
+repair_upnp() { svc restart_upnp; }
+
+# ntpd has no enable gate; a router always runs it. Opt-in because a stale
+# clock is an annoyance, not an outage — and stop_ntpd is the thing that
+# wedges, so poking it during a wedge is the least useful thing we could do.
+should_run_ntpd() { return 0; }
+is_ok_ntpd() {
+	have_proc ntp && { OK_WHY="ntp running"; return 0; }
+	OK_WHY="no ntp process"; return 1
+}
+repair_ntpd() { svc restart_ntpd; }
+
+# ===========================================================================
+# Framework
+# ===========================================================================
+check_enabled() {
+	for _c in $HEAL_CHECKS; do [ "$_c" = "$1" ] && return 0; done
+	return 1
+}
+
+# run_check <name> -> STATE=ok|broken|skip, WHY=...
+STATE=""; WHY=""
+run_check() {
+	_n="$1"; SR_WHY=""; OK_WHY=""
+	should_run_"$_n"
+	case "$?" in
+		1) STATE=skip;  WHY="$SR_WHY"; return ;;
+		2) STATE=skip;  WHY="indeterminate: $SR_WHY"; return ;;
+	esac
+	if is_ok_"$_n"; then STATE=ok; WHY="$OK_WHY"; else STATE=broken; WHY="$OK_WHY"; fi
+}
+
+# --- per-check rate limiting ----------------------------------------------
 heals_in_window() {
-	_f="$RUN/healtimes"
+	_f="$RUN/$1.healtimes"
 	[ -f "$_f" ] || { echo 0; return; }
 	_cut=$(( $(now) - WINDOW )); _n=0
 	while read -r t; do
@@ -166,7 +302,7 @@ heals_in_window() {
 }
 
 record_heal() {
-	_f="$RUN/healtimes"; _cut=$(( $(now) - WINDOW )); _tmp="$_f.tmp"
+	_f="$RUN/$1.healtimes"; _cut=$(( $(now) - WINDOW )); _tmp="$_f.tmp"
 	: > "$_tmp"
 	if [ -f "$_f" ]; then
 		while read -r t; do
@@ -174,26 +310,27 @@ record_heal() {
 			[ "$t" -gt "$_cut" ] 2>/dev/null && echo "$t" >> "$_tmp"
 		done < "$_f"
 	fi
-	now >> "$_tmp"; mv "$_tmp" "$_f"; now > "$RUN/lastheal"
+	now >> "$_tmp"; mv "$_tmp" "$_f"; now > "$RUN/$1.lastheal"
 }
 
-# --- healing ---------------------------------------------------------------
-heal() {
-	log "HEAL: $REASON — running 'service restart_firewall'"
-	record_heal
-	service restart_firewall >/dev/null 2>&1
+# repair_check <name> — assumes STATE=broken and rate limits already cleared
+repair_check() {
+	_n="$1"
+	log "REPAIR[$_n]: $WHY — running repair"
+	record_heal "$_n"
+	repair_"$_n"
 	sleep "$RECHECK_WAIT"
+	run_check "$_n"
+	case "$STATE" in
+		ok)   log "REPAIR OK[$_n]: $WHY"; return 0 ;;
+		skip) log "REPAIR INCONCLUSIVE[$_n]: $WHY"; return 1 ;;
+	esac
+	log "REPAIR FAILED[$_n]: still broken — $WHY"
 
-	if check_invariant && [ "$INDETERMINATE" = "0" ]; then
-		log "HEAL OK: $REASON"
-		return 0
-	fi
-	if [ "$INDETERMINATE" = "1" ]; then
-		log "HEAL INCONCLUSIVE: $REASON"
-		return 1
-	fi
-
-	log "HEAL FAILED: still broken after restart_firewall — $REASON"
+	# Reboot escalation is deliberately tied to the firewall check only: it is
+	# the one whose failure takes the entire LAN offline, and rebooting for a
+	# stopped Samba would be wildly disproportionate.
+	[ "$_n" = "firewall" ] || return 1
 
 	if [ ! -f "$REBOOT_FLAG" ]; then
 		log "ESCALATION DISABLED: create $REBOOT_FLAG to permit reboot escalation. Manual action required."
@@ -204,39 +341,51 @@ heal() {
 		log "ESCALATION SUPPRESSED: last escalated reboot ${_age}s ago (< $REBOOT_MIN_GAP). Manual action required."
 		return 1
 	fi
-
 	log "ESCALATING: rebooting (restart_firewall did not resolve the fault)"
-	now > "$PERSIST_REBOOT"
-	sync
-	reboot
+	now > "$PERSIST_REBOOT"; sync; reboot
 	return 1
 }
 
+ALL_CHECKS="firewall wireguard dnsmasq samba upnp ntpd"
+
 # --- subcommands -----------------------------------------------------------
 cmd_check() {
-	if check_invariant; then
-		[ "$INDETERMINATE" = "1" ] && { say "UNKNOWN: $REASON"; return 2; }
-		say "OK: $REASON"; return 0
-	fi
-	say "BROKEN: $REASON"; return 1
+	_rc=0; _any_unknown=0
+	for c in $ALL_CHECKS; do
+		check_enabled "$c" || continue
+		run_check "$c"
+		case "$STATE" in
+			ok)     printf 'OK      %-10s %s\n' "$c" "$WHY" ;;
+			broken) printf 'BROKEN  %-10s %s\n' "$c" "$WHY"; _rc=1 ;;
+			skip)   printf 'SKIP    %-10s %s\n' "$c" "$WHY"; _any_unknown=1 ;;
+		esac
+	done
+	[ "$_rc" = "1" ] && return 1
+	[ "$_any_unknown" = "1" ] && return 2
+	return 0
 }
 
 cmd_status() {
 	unit=$(active_unit) || unit="?"
 	say "nat-doctor $VERSION"
 	say ""
+	say "active checks     : $HEAL_CHECKS"
+	say "available         : $ALL_CHECKS"
+	say ""
 	say "active WAN unit   : $unit"
 	say "proto             : $(nvram get wan${unit}_proto 2>/dev/null)"
 	say "state_t           : $(nvram get wan${unit}_state_t 2>/dev/null) (2 = connected)"
 	say "netdev            : $(active_ifname "$unit" 2>/dev/null || echo '<undetermined>')"
-	say "port forwarding   : $(forwards_configured && echo enabled || echo 'disabled/none')"
 	say "VSERVER rules     : $(vserver_rule_count)"
 	say ""
 	say "POSTROUTING:"
 	iptables -t nat -S POSTROUTING 2>/dev/null | sed 's/^/  /'
 	say ""
-	say "last heal         : $(read_ts "$RUN/lastheal")"
-	say "heals in window   : $(heals_in_window)/$MAXHEALS (last ${WINDOW}s)"
+	for c in $ALL_CHECKS; do
+		check_enabled "$c" || continue
+		printf '  %-10s heals %s/%s  last %s\n' "$c" "$(heals_in_window "$c")" "$MAXHEALS" "$(read_ts "$RUN/$c.lastheal")"
+	done
+	say ""
 	say "last esc. reboot  : $(read_ts "$PERSIST_REBOOT")"
 	say "reboot escalation : $([ -f "$REBOOT_FLAG" ] && echo enabled || echo 'disabled (default)')"
 	say "watchdog cron     : $(cru l 2>/dev/null | grep -c nat-doctor-wd) entry/entries"
@@ -245,38 +394,68 @@ cmd_status() {
 }
 
 cmd_log() {
-	if [ -f /tmp/syslog.log ]; then
-		grep "$TAG" /tmp/syslog.log | tail -40
-	else
-		logread 2>/dev/null | grep "$TAG" | tail -40
-	fi
+	if [ -f /tmp/syslog.log ]; then grep "$TAG" /tmp/syslog.log | tail -40
+	else logread 2>/dev/null | grep "$TAG" | tail -40; fi
 }
 
 cmd_watchdog() {
-	# Single instance. A heal takes RECHECK_WAIT seconds while cron fires every
-	# minute; overlapping runs must never stack restart_firewall calls.
+	# Single instance. A repair takes RECHECK_WAIT seconds while cron fires
+	# every minute; overlapping runs must never stack service restarts.
 	# PID + /proc, never `ps | grep` — a broad grep can match the calling SSH
 	# session (see AGENTS.md).
+	# The lock records its START TIME as well as its pid, so a HUNG holder can
+	# be told apart from a busy one. Without that, a single wedged `service`
+	# call would hold the lock forever and silently disable the watchdog — the
+	# worst possible failure, because everything would look installed and fine.
 	if [ -f "$LOCK" ]; then
-		_pid=$(cat "$LOCK" 2>/dev/null)
-		[ -n "$_pid" ] && [ -d "/proc/$_pid" ] && return 0
+		read -r _pid _lts < "$LOCK" 2>/dev/null
+		if [ -n "$_pid" ] && [ -d "/proc/$_pid" ]; then
+			_age=$(( $(now) - ${_lts:-0} ))
+			if [ "$_age" -lt "$LOCK_STALE" ]; then
+				return 0
+			fi
+			log "STALE LOCK: pid $_pid has held the lock ${_age}s (> $LOCK_STALE) — assuming hung, killing it and taking over"
+			kill -KILL "$_pid" 2>/dev/null
+		fi
 	fi
-	echo $$ > "$LOCK"
+	echo "$$ $(now)" > "$LOCK"
 	trap 'rm -f "$LOCK"' EXIT INT TERM
 
-	check_invariant && return 0
+	for c in $ALL_CHECKS; do
+		check_enabled "$c" || continue
+		_el=$(run_elapsed)
+		if [ "$_el" -ge "$MAX_RUN" ]; then
+			log "DEADLINE: run has taken ${_el}s (>= $MAX_RUN) — abandoning remaining checks, will retry next minute"
+			break
+		fi
+		run_check "$c"
+		[ "$STATE" = "broken" ] || continue
 
-	_since=$(( $(now) - $(read_ts "$RUN/lastheal") ))
-	if [ "$_since" -lt "$COOLDOWN" ]; then
-		log "SKIP: broken ($REASON) but last heal ${_since}s ago (< $COOLDOWN)"
-		return 0
-	fi
-	_n=$(heals_in_window)
-	if [ "$_n" -ge "$MAXHEALS" ]; then
-		log "STANDING DOWN: $_n heals in ${WINDOW}s and still broken ($REASON). Manual action required."
-		return 1
-	fi
-	heal
+		_since=$(( $(now) - $(read_ts "$RUN/$c.lastheal") ))
+		if [ "$_since" -lt "$COOLDOWN" ]; then
+			log "SKIP[$c]: broken ($WHY) but last repair ${_since}s ago (< $COOLDOWN)"
+			continue
+		fi
+		_n=$(heals_in_window "$c")
+		if [ "$_n" -ge "$MAXHEALS" ]; then
+			log "STANDING DOWN[$c]: $_n repairs in ${WINDOW}s and still broken ($WHY). Manual action required."
+			continue
+		fi
+		repair_check "$c"
+	done
+}
+
+cmd_heal() {
+	_target="$1"
+	for c in $ALL_CHECKS; do
+		[ -n "$_target" ] && [ "$c" != "$_target" ] && continue
+		[ -n "$_target" ] || check_enabled "$c" || continue
+		run_check "$c"
+		case "$STATE" in
+			broken) repair_check "$c" ;;
+			*)      say "skip $c: $STATE — $WHY" ;;
+		esac
+	done
 }
 
 case "$1" in
@@ -284,17 +463,20 @@ case "$1" in
 	status)   cmd_status ;;
 	log)      cmd_log ;;
 	watchdog) cmd_watchdog ;;
-	heal)     check_invariant; heal ;;
+	heal)     cmd_heal "$2" ;;
 	version)  say "nat-doctor $VERSION" ;;
 	*)
 		say "natctl $VERSION — nat-doctor for Asuswrt-Merlin"
 		say ""
-		say "usage: natctl {check|status|log|watchdog|heal|version}"
+		say "usage: natctl {check|status|log|watchdog|heal [check]|version}"
 		say ""
-		say "  check     report the invariant, take no action (0=ok 1=broken 2=unknown)"
-		say "  status    full diagnostic dump + check"
-		say "  log       recent nat-doctor syslog lines"
-		say "  watchdog  cron entrypoint: check, heal if broken, escalate if permitted"
-		say "  heal      force a heal attempt now (ignores cooldown)"
+		say "  check       report every active check (0=all ok 1=broken 2=some unknown)"
+		say "  status      full diagnostic dump + check"
+		say "  log         recent nat-doctor syslog lines"
+		say "  watchdog    cron entrypoint: check each, repair what is broken"
+		say "  heal [name] force a repair now (ignores cooldown); optionally one check"
+		say ""
+		say "  checks: $ALL_CHECKS"
+		say "  active: $HEAL_CHECKS   (set HEAL_CHECKS in $CONF)"
 		exit 2 ;;
 esac

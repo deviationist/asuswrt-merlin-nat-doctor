@@ -1,18 +1,22 @@
 #!/bin/sh
 # tests/invariant.sh — fixtures for nat-doctor's detection logic.
 #
-# Run after ANY change to active_unit(), active_ifname(), masq_present(),
-# vserver_rule_count(), forwards_configured() or check_invariant().
+# Run after ANY change to a should_run_*/is_ok_* function or to run_check().
 #
 # It extracts those functions VERBATIM from scripts/natctl and drives them
-# against a stubbed nvram, iptables and netdev namespace. This is the repo's
-# only automated regression net, and it exists mainly to pin one rule:
+# against a stubbed nvram, iptables, wg, pidof and netdev namespace. This is
+# the repo's only automated regression net, and it pins two rules that will
+# cause real damage if they ever break:
 #
-#   THE CHECK MUST FOLLOW THE ACTIVE WAN, NEVER A HARDCODED INTERFACE.
+#   1. THE FIREWALL CHECK FOLLOWS THE ACTIVE WAN, NEVER A HARDCODED INTERFACE.
+#      Hardcoded to the primary's ethN, it would see "no MASQUERADE" while
+#      failed over to a PPP secondary and restart the firewall every minute
+#      for the whole outage. Cases 4-6.
 #
-# If it followed the primary's ethN while the router was failed over to a PPP
-# secondary, it would see "no MASQUERADE" and restart the firewall every
-# minute for the whole outage. Cases 4-6 exist to make that regression loud.
+#   2. A SERVICE THE USER DISABLED IS NEVER "REPAIRED".
+#      should_run must come from what nvram DECLARES, not from what is
+#      running. Get this wrong and the watchdog fights the owner's own
+#      configuration every minute, forever. Cases 12, 16, 18, 19.
 #
 #   sh tests/invariant.sh
 
@@ -23,11 +27,15 @@ SRC="${NATCTL_SRC:-$SELF_DIR/../scripts/natctl}"
 [ -f "$SRC" ] || { echo "cannot find $SRC" >&2; exit 1; }
 
 # --- extract the functions under test, verbatim ----------------------------
-BLOCK=$(sed -n '/^active_unit() {/,/^# --- rate limiting/p' "$SRC" | sed '$d')
-case "$BLOCK" in
-	*"check_invariant()"*) ;;
-	*) echo "extraction failed — did the function block or its trailing marker move?" >&2; exit 1 ;;
-esac
+BLOCK=$(sed -n '/^active_unit() {/,/^# --- per-check rate limiting/p' "$SRC" | sed '$d')
+for needed in active_ifname should_run_firewall is_ok_firewall \
+              should_run_wireguard is_ok_wireguard \
+              should_run_dnsmasq is_ok_dnsmasq run_check; do
+	case "$BLOCK" in
+		*"$needed"*) ;;
+		*) echo "extraction failed: $needed missing — did the block or its trailing marker move?" >&2; exit 1 ;;
+	esac
+done
 
 # --- stubs -----------------------------------------------------------------
 NETDEV_ROOT=$(mktemp -d 2>/dev/null || echo /tmp/natdoc-test.$$)
@@ -48,34 +56,56 @@ iptables() {
 	esac
 }
 
+# `wg show <iface>` succeeds only for interfaces listed in WG_IFACES.
+wg() {
+	for _i in $WG_IFACES; do [ "$_i" = "$2" ] && return 0; done
+	return 1
+}
+
+# pidof succeeds only for names listed in PROCS.
+pidof() {
+	for _p in $PROCS; do [ "$_p" = "$1" ] && { echo 1234; return 0; }; done
+	return 1
+}
+
+log() { :; }
+
+# have_proc is defined in natctl's helper section, above the extracted block.
+# Pull it verbatim rather than reimplementing it — a test that reimplements
+# the thing under test proves nothing.
+HELPER=$(grep '^have_proc()' "$SRC")
+[ -n "$HELPER" ] || { echo "extraction failed: have_proc missing" >&2; exit 1; }
+eval "$HELPER"
+
 eval "$BLOCK"
 
 reset() {
 	for k in wan_primary wan0_primary wan1_primary \
 	         wan0_proto wan1_proto wan0_ifname wan1_ifname \
 	         wan0_pppoe_ifname wan1_pppoe_ifname \
-	         wan0_state_t wan1_state_t vts_enable_x vts_rulelist; do
+	         wan0_state_t wan1_state_t vts_enable_x vts_rulelist \
+	         wgs_enable wgs_unit sw_mode enable_samba upnp_enable; do
 		eval "NV_$k=''"
 	done
-	IPT_POSTROUTING=""
-	IPT_VSERVER=""
+	IPT_POSTROUTING=""; IPT_VSERVER=""; WG_IFACES=""; PROCS=""
+}
+
+# A healthy firewall baseline, so non-firewall cases don't trip over it.
+fw_healthy() {
+	NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2
+	NV_vts_enable_x=0
+	IPT_POSTROUTING="$MASQ_ETH0"; IPT_VSERVER="$VS_EMPTY"
 }
 
 PASS=0; FAIL=0
 expect() {
-	_want="$1"; _name="$2"
-	# Deliberately NOT a command substitution: REASON must survive into the
-	# failure message, and a subshell would swallow it.
-	if check_invariant; then
-		if [ "$INDETERMINATE" = "1" ]; then _got=UNKNOWN; else _got=OK; fi
+	_want="$1"; _check="$2"; _name="$3"
+	run_check "$_check"
+	if [ "$STATE" = "$_want" ]; then
+		PASS=$((PASS + 1)); printf '  ok    %-9s %s  [%s]\n' "$_check" "$_name" "$STATE"
 	else
-		_got=BROKEN
-	fi
-	if [ "$_got" = "$_want" ]; then
-		PASS=$((PASS + 1)); echo "  ok    $_name  [$_got]"
-	else
-		FAIL=$((FAIL + 1)); echo "  FAIL  $_name  expected $_want, got $_got"
-		echo "        reason: $REASON"
+		FAIL=$((FAIL + 1)); printf '  FAIL  %-9s %s  expected %s, got %s\n' "$_check" "$_name" "$_want" "$STATE"
+		printf '        why: %s\n' "$WHY"
 	fi
 }
 
@@ -90,80 +120,127 @@ VS_FULL="-N VSERVER
 -A VSERVER -p tcp -m tcp --dport 443 -j DNAT --to-destination 192.168.1.10:443"
 VS_EMPTY="-N VSERVER"
 
-echo "nat-doctor invariant fixtures"
+echo "nat-doctor fixtures"
 echo ""
+echo "-- firewall --"
 
-# 1 — healthy primary
-reset
-NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2
-NV_vts_enable_x=1; NV_vts_rulelist="<x"
-IPT_POSTROUTING="$MASQ_ETH0"; IPT_VSERVER="$VS_FULL"
-expect OK "healthy primary (dhcp/eth0, masq + forwards present)"
+# 1
+reset; NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2
+NV_vts_enable_x=1; NV_vts_rulelist="<x"; IPT_POSTROUTING="$MASQ_ETH0"; IPT_VSERVER="$VS_FULL"
+expect ok firewall "healthy primary"
 
-# 2 — THE FAULT: connected, but no masquerade
-reset
-NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2
-NV_vts_enable_x=1; NV_vts_rulelist="<x"
+# 2 — THE FAULT
+reset; NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2
+NV_vts_enable_x=1; NV_vts_rulelist="<x"; IPT_POSTROUTING="$NO_MASQ"; IPT_VSERVER="$VS_EMPTY"
+expect broken firewall "connected but MASQUERADE missing"
+
+# 3
+reset; NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=0
 IPT_POSTROUTING="$NO_MASQ"; IPT_VSERVER="$VS_EMPTY"
-expect BROKEN "the fault: wan connected but MASQUERADE missing"
+expect skip firewall "WAN down — absent rules are correct"
 
-# 3 — WAN legitimately down: rules absent is CORRECT, must not heal
-reset
-NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=0
-IPT_POSTROUTING="$NO_MASQ"; IPT_VSERVER="$VS_EMPTY"
-expect UNKNOWN "wan down (state_t=0) — absent rules are correct"
+# 4 — LANDMINE
+reset; NV_wan_primary=1; NV_wan1_proto=pppoe; NV_wan1_ifname=/dev/ttyUSB0
+NV_wan1_pppoe_ifname=ppp0; NV_wan1_state_t=2; NV_vts_enable_x=0
+IPT_POSTROUTING="$MASQ_PPP0"; IPT_VSERVER="$VS_EMPTY"
+expect ok firewall "failover to PPP — follows ppp0, not eth0"
 
-# 4 — LANDMINE: failed over to PPP secondary, masq on ppp0.
-#     A check hardcoded to eth0 would call this BROKEN and restart the
-#     firewall every minute for the entire outage.
-reset
-NV_wan_primary=1; NV_wan1_proto=pppoe; NV_wan1_ifname=/dev/ttyUSB0
-NV_wan1_pppoe_ifname=ppp0; NV_wan1_state_t=2
-NV_vts_enable_x=1; NV_vts_rulelist="<x"
-IPT_POSTROUTING="$MASQ_PPP0"; IPT_VSERVER="$VS_FULL"
-expect OK "failover to PPP secondary — follows ppp0, not eth0"
-
-# 5 — PPP secondary still coming up: netdev not yet published
-reset
-NV_wan_primary=1; NV_wan1_proto=pppoe; NV_wan1_ifname=/dev/ttyUSB0
+# 5
+reset; NV_wan_primary=1; NV_wan1_proto=pppoe; NV_wan1_ifname=/dev/ttyUSB0
 NV_wan1_pppoe_ifname=""; NV_wan1_state_t=2
 IPT_POSTROUTING="$NO_MASQ"; IPT_VSERVER="$VS_EMPTY"
-expect UNKNOWN "PPP netdev not yet published — skip, never heal"
+expect skip firewall "PPP netdev not yet published"
 
-# 6 — a serial device is not a netdev and must never be used as one
-reset
-NV_wan_primary=1; NV_wan1_proto=dhcp; NV_wan1_ifname=/dev/ttyUSB0
-NV_wan1_state_t=2
+# 6
+reset; NV_wan_primary=1; NV_wan1_proto=dhcp; NV_wan1_ifname=/dev/ttyUSB0; NV_wan1_state_t=2
 IPT_POSTROUTING="$NO_MASQ"; IPT_VSERVER="$VS_EMPTY"
-expect UNKNOWN "/dev/ttyUSB0 rejected as a netdev"
+expect skip firewall "/dev/ttyUSB0 rejected as a netdev"
 
-# 7 — masq fine, but every port forward vanished
-reset
-NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2
-NV_vts_enable_x=1; NV_vts_rulelist="<x"
-IPT_POSTROUTING="$MASQ_ETH0"; IPT_VSERVER="$VS_EMPTY"
-expect BROKEN "VSERVER emptied while port forwarding is enabled"
+# 7
+reset; NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2
+NV_vts_enable_x=1; NV_vts_rulelist="<x"; IPT_POSTROUTING="$MASQ_ETH0"; IPT_VSERVER="$VS_EMPTY"
+expect broken firewall "VSERVER emptied while forwarding enabled"
 
-# 8 — empty VSERVER is CORRECT when the user configures no forwards
-reset
-NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2
-NV_vts_enable_x=0; NV_vts_rulelist=""
-IPT_POSTROUTING="$MASQ_ETH0"; IPT_VSERVER="$VS_EMPTY"
-expect OK "no forwards configured — empty VSERVER is correct"
+# 8
+reset; NV_wan_primary=0; NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2
+NV_vts_enable_x=0; IPT_POSTROUTING="$MASQ_ETH0"; IPT_VSERVER="$VS_EMPTY"
+expect ok firewall "no forwards configured — empty VSERVER correct"
 
-# 9 — unresolvable active unit
-reset
-NV_wan_primary=""; NV_wan0_primary=0; NV_wan1_primary=0
+# 9
+reset; NV_wan_primary=""; NV_wan0_primary=0; NV_wan1_primary=0
 IPT_POSTROUTING="$NO_MASQ"; IPT_VSERVER="$VS_EMPTY"
-expect UNKNOWN "cannot determine active WAN unit — skip"
+expect skip firewall "cannot determine active WAN unit"
 
-# 10 — wan_primary unset but wanN_primary flags usable
-reset
-NV_wan_primary=""; NV_wan0_primary=1
-NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2
-NV_vts_enable_x=0
+# 10
+reset; NV_wan_primary=""; NV_wan0_primary=1
+NV_wan0_proto=dhcp; NV_wan0_ifname=eth0; NV_wan0_state_t=2; NV_vts_enable_x=0
 IPT_POSTROUTING="$MASQ_ETH0"; IPT_VSERVER="$VS_EMPTY"
-expect OK "falls back to wanN_primary when wan_primary is unset"
+expect ok firewall "falls back to wanN_primary"
+
+echo ""
+echo "-- wireguard --"
+
+# 11
+reset; fw_healthy; NV_wgs_enable=1; NV_wgs_unit=1; WG_IFACES="wgs1"
+expect ok wireguard "enabled and wgs1 up"
+
+# 12 — the 2026-09-22 casualty
+reset; fw_healthy; NV_wgs_enable=1; NV_wgs_unit=1; WG_IFACES=""
+expect broken wireguard "enabled but interface missing"
+
+# 13 — DO NOT FIGHT THE OWNER'S CONFIG
+reset; fw_healthy; NV_wgs_enable=0; NV_wgs_unit=1; WG_IFACES=""
+expect skip wireguard "deliberately disabled — absence is correct"
+
+# 14
+reset; fw_healthy; NV_wgs_enable=""; WG_IFACES=""
+expect skip wireguard "wgs_enable unreadable"
+
+# 15 — unit number is a variable, not a constant
+reset; fw_healthy; NV_wgs_enable=1; NV_wgs_unit=2; WG_IFACES="wgs2"
+expect ok wireguard "honours wgs_unit=2 (wgs2, not wgs1)"
+
+# 16
+reset; fw_healthy; NV_wgs_enable=1; NV_wgs_unit=""; WG_IFACES="wgs1"
+expect skip wireguard "wgs_unit unreadable"
+
+echo ""
+echo "-- dnsmasq --"
+
+# 17
+reset; fw_healthy; NV_sw_mode=1; PROCS="dnsmasq"
+expect ok dnsmasq "router mode, dnsmasq running"
+
+# 18
+reset; fw_healthy; NV_sw_mode=1; PROCS=""
+expect broken dnsmasq "router mode, dnsmasq absent"
+
+# 19 — AP mode does not run dnsmasq
+reset; fw_healthy; NV_sw_mode=3; PROCS=""
+expect skip dnsmasq "AP mode — dnsmasq not expected"
+
+# 20
+reset; fw_healthy; NV_sw_mode=""; PROCS=""
+expect skip dnsmasq "sw_mode unreadable"
+
+echo ""
+echo "-- opt-in checks --"
+
+# 21
+reset; fw_healthy; NV_enable_samba=1; PROCS="smbd"
+expect ok samba "samba enabled and running"
+# 22
+reset; fw_healthy; NV_enable_samba=1; PROCS=""
+expect broken samba "samba enabled but smbd absent"
+# 23
+reset; fw_healthy; NV_enable_samba=0; PROCS=""
+expect skip samba "samba disabled — absence is correct"
+# 24
+reset; fw_healthy; NV_upnp_enable=0; PROCS=""
+expect skip upnp "upnp disabled — absence is correct"
+# 25
+reset; fw_healthy; NV_upnp_enable=1; PROCS=""
+expect broken upnp "upnp enabled but miniupnpd absent"
 
 echo ""
 echo "passed: $PASS   failed: $FAIL"

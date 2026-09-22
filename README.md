@@ -107,27 +107,55 @@ boot hook so the watchdog survives reboots, and prints a status report.
 ## Commands
 
 ```
-natctl status      # what it sees right now: active WAN, netdev, rules, counters
-natctl check       # invariant only — exit 0=healthy 1=broken 2=cannot tell
-natctl log         # what it has detected and healed
-natctl heal        # force a heal attempt now (ignores cooldown)
-natctl watchdog    # the cron entrypoint
+natctl status        # active WAN, netdev, rules, per-check counters, + check
+natctl check         # every active check — exit 0=all ok 1=broken 2=some unknown
+natctl log           # what it has detected and repaired
+natctl heal [check]  # force a repair now (ignores cooldown); optionally just one
+natctl watchdog      # the cron entrypoint
 natctl version
 ```
 
 ## How it decides
 
-The fault state is unambiguous and **cannot occur legitimately**:
+The WAN-up cascade is a chain of stop/start pairs, and a wedge strands
+whatever pair it died inside — so the damage differs every time. Two observed
+incidents on the same router:
 
-> the active WAN unit is connected (`state_t=2`) **and** its netdev has no
-> `MASQUERADE` rule in `POSTROUTING`
+| | 2026-09-13 | 2026-09-22 |
+|---|---|---|
+| died after | WireGuard *restarted* | `WireGuard: Stopping server` |
+| NAT rules | missing | missing |
+| WireGuard server | fine | **interface gone — total VPN lockout** |
 
-plus a secondary trigger: masquerade present but `VSERVER` empty *while port
-forwarding is configured*.
+So nat-doctor runs several independent checks. Each answers **three**
+questions, and only acts when all three are unambiguous:
 
-On violation: one `service restart_firewall`, wait, re-check. If it's fixed,
-log and stop. If not, log loudly and — only if you have explicitly opted in —
-escalate to a reboot.
+```
+should_run   what the router's config DECLARES   (nvram)
+is_ok        observable reality                  (rules / interface / process)
+enabled      whether you want it watched         (HEAL_CHECKS)
+```
+
+| Check | Declared by | Broken when | Repair |
+|---|---|---|---|
+| `firewall` | WAN `state_t=2` | no `MASQUERADE` for the active WAN, or `VSERVER` empty while forwarding is on | `restart_firewall` |
+| `wireguard` | `wgs_enable=1` | `wgs${wgs_unit}` interface absent | `restart_wgs` |
+| `dnsmasq` | `sw_mode=1` | no `dnsmasq` process | `restart_dnsmasq` |
+| `samba` | `enable_samba=1` | no `smbd` | `restart_samba` |
+| `upnp` | `upnp_enable=1` | no `miniupnpd` | `restart_upnp` |
+| `ntpd` | — | no `ntp` process | `restart_ntpd` |
+
+Default active: `firewall wireguard dnsmasq` — the three with confirmed
+failure modes. The rest are opt-in.
+
+**`should_run` comes from what nvram declares, never from what's running.**
+If you have deliberately disabled WireGuard, its absence is *correct* and
+nat-doctor leaves it alone. Getting this backwards would mean a watchdog that
+fights your own configuration every minute, forever.
+
+On a violation: one repair, wait, re-check. Fixed → log and stop. Still
+broken → log loudly and, only for `firewall` and only if you explicitly opted
+in, escalate to a reboot.
 
 ### Safety
 
@@ -144,7 +172,13 @@ positive restarts your firewall:
 | PID lockfile | A heal outlives the 60s cron interval; runs must not stack |
 | `COOLDOWN` (300s) | No thrashing |
 | `MAXHEALS` per `WINDOW` (3/hour) | After that it stands down and only logs. A watchdog that can't stop trying is worse than none |
-| Reboot escalation **off by default** | Opt in with `touch /jffs/scripts/nat-doctor.reboot-ok` |
+| `should_run` read from nvram, not from what's running | A service you disabled must never be "repaired" |
+| Unreadable nvram gate ⇒ skip | Never act on intent we had to guess |
+| Per-check cooldown and counters | One flapping check can't suppress repairs for the others |
+| `REPAIR_TIMEOUT` on every repair | Our repairs use the queue that this bug wedges |
+| `MAX_RUN` deadline per run | A long run can't outlive its usefulness |
+| Lock stores its start time | Distinguishes a hung holder from a busy one, so a wedged repair can't silently disable the watchdog |
+| Reboot escalation **off by default**, `firewall` only | Opt in with `touch /jffs/scripts/nat-doctor.reboot-ok`. Rebooting over a stopped Samba would be absurd |
 | Reboot rate limit survives reboots | Otherwise an escalation could loop |
 
 ## Tunables
@@ -153,12 +187,24 @@ Optional, in `/jffs/scripts/nat-doctor.conf` (sourced over the defaults; the
 installer never writes or overwrites this file):
 
 ```sh
-COOLDOWN=300           # min seconds between heal attempts
-MAXHEALS=3             # max heals per WINDOW before standing down
+HEAL_CHECKS="firewall wireguard dnsmasq"   # available: samba upnp ntpd
+
+COOLDOWN=300           # min seconds between repair attempts, PER CHECK
+MAXHEALS=3             # max repairs per WINDOW per check, then stand down
 WINDOW=3600
-RECHECK_WAIT=30        # settle time before re-checking after restart_firewall
+RECHECK_WAIT=30        # settle time before re-checking after a repair
 REBOOT_MIN_GAP=21600   # 6h minimum between escalated reboots
+
+REPAIR_TIMEOUT=60      # hard-kill a repair command that hangs this long
+MAX_RUN=240            # abandon the whole run after this many seconds
+LOCK_STALE=600         # a lock held longer than this means the holder is hung
 ```
+
+Those last three are not ordinary tuning knobs. Repairs call `service`, which
+goes through the **same `rc_service` queue whose wedging causes this fault** —
+so a repair attempted while that queue is stuck can hang indefinitely. Without
+these bounds, one hung call would hold the lock forever and silently disable
+the watchdog while everything still looked installed and healthy.
 
 ## Uninstall
 

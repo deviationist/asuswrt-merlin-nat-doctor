@@ -42,10 +42,30 @@ were learned there; they apply here unchanged.
 ## Design invariants (do not weaken)
 
 - **When in doubt, do nothing.** Every indeterminate state — unknown WAN unit,
-  unresolvable netdev, WAN legitimately down — is a SKIP, never a heal. A
-  false positive restarts the entire firewall. `check_invariant()` returns 0
-  for both "healthy" and "cannot tell", and sets `INDETERMINATE=1` for the
-  latter so callers can report honestly. Do not collapse those two.
+  unresolvable netdev, WAN legitimately down, an unreadable nvram gate — is a
+  SKIP, never a repair. A false positive restarts real services.
+- **Every check answers THREE questions, and `should_run` comes from nvram.**
+  `should_run_*` reports what the router's config DECLARES (0=yes, 1=no,
+  2=cannot tell), `is_ok_*` reports observable reality, and `HEAL_CHECKS`
+  says whether the operator wants us watching at all. **A service the user
+  deliberately disabled must never be "repaired"** — inferring intent from
+  what is running instead of what is declared would make the watchdog fight
+  the owner's own configuration every minute, forever. Fixtures 13, 19, 23
+  and 24 pin this; if you change a gate, add a disabled-case fixture.
+- **Every repair is bounded, and the bounds are not optional.** Repairs call
+  `service`, which goes through `notify_rc` into the SAME `rc_service` queue
+  whose wedging causes this fault — so a repair attempted during a wedge can
+  hang forever. `REPAIR_TIMEOUT` kills a hung repair, `MAX_RUN` abandons an
+  over-long run, and the lockfile stores its start time so `LOCK_STALE` can
+  tell a hung holder from a busy one. Without that last part a single wedged
+  `service` call would hold the lock forever and **silently disable the
+  watchdog while everything still looked installed and healthy** — the worst
+  failure mode available to this program.
+- **Rate limiting is per check, not global.** A shared cooldown would let one
+  flapping check suppress repairs for every other. `MAXHEALS` per `WINDOW` is
+  a rolling window, so a check stands down and then retries later rather than
+  giving up permanently — the fault is recurring, so permanent surrender
+  would be wrong.
 - **THE CHECK MUST FOLLOW THE ACTIVE WAN, NEVER A HARDCODED INTERFACE.**
   This is the single most safety-critical rule here. On a dual-WAN router
   failed over to a PPP secondary, NAT lives on `pppN`, not the primary's
@@ -77,6 +97,29 @@ were learned there; they apply here unchanged.
 
 Collected live on an RT-BE92U, Merlin 3006.102.8. Re-verify before relying on
 any of these on another model:
+
+- **There is no `timeout` applet.** `flock`, `kill`, `pidof` and `sleep` exist.
+  `run_limited()` supervises by hand because of this.
+- **`strings /sbin/rc | grep restart_` UNDER-REPORTS.** `restart_firewall` and
+  `restart_wgs` are both absent from that list and both work. Use it as a hint,
+  never to reject a service name — verify by running it.
+- **Verified repair commands** (each actually executed on the router):
+  `restart_firewall` (healed a live fault 2026-09-22), `restart_wgs` (restored
+  a missing `wgs1` the same night), `restart_dnsmasq` (pid changed cleanly,
+  DNS resolving after). `restart_samba`, `restart_ntpd`, `restart_upnp` appear
+  in the strings list but have NOT been executed — which is part of why they
+  are opt-in.
+- **`restart_firewall` does NOT restore the WireGuard server.** It rebuilds
+  iptables, not interfaces. A separate `restart_wgs` is required. This is why
+  the wireguard check exists.
+- **`wgs_unit` names the interface** — it is `wgs${wgs_unit}`, not a hardcoded
+  `wgs1`. Same class of bug as hardcoding the WAN interface.
+- **`dnsmasq` has no enable key.** Intent is inferred from `sw_mode`
+  (1=router, 2=repeater, 3=AP). `dnsmasq_enable` does not exist.
+- **The `stop_ntpd` wedge is not DNS-related.** Switching the router's NTP
+  servers from hostnames to literal IPs on 2026-09-14 did NOT prevent a
+  recurrence on 2026-09-22 — it wedged on `stop_ntpd` again. Whatever hangs
+  in there, it is not name resolution. Do not re-propose that theory.
 
 - `service restart_wgs` rebuilds WireGuard server peers from nvram;
   `service restart_wgsc <n>` does **not** — it only re-reads that peer's
